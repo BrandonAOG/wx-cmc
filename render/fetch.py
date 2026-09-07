@@ -77,13 +77,13 @@ def latest_available_run(now: dt.datetime | None = None,
     raise RuntimeError("No GFS run found on NOMADS in the last 48 h")
 
 
-def _probe_url(run: dt.datetime, step: int) -> str | None:
+def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
     """A file whose presence means `step` of this run is published."""
     src = MODEL["source"]
     if src == "ecmwf_opendata":
         return ECMWF_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step)
     if src == "cmc":
-        return cmc_urls(run, step, {("msl", None)})[0]
+        return cmc_urls(run, step, {("msl", None)}, session)[0]
     if src == "icon":
         return icon_urls(run, step, {("msl", None)})[0]
     return None
@@ -96,12 +96,14 @@ def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> i
         return MODEL["hours"][-1]
     session = session or requests.Session()
     for last in MODEL.get("probe_max_hours", [MODEL["hours"][-1]]):
-        url = _probe_url(run, last)
+        url = _probe_url(run, last, session)
         try:
-            if session.head(url, timeout=30, allow_redirects=True).status_code == 200:
+            r = session.get(url, timeout=30, allow_redirects=True, stream=True); r.close()
+            if r.status_code == 200:
                 return last
+            log.info("probe %s -> HTTP %s", url.rsplit("/", 1)[-1], r.status_code)
         except requests.RequestException as e:
-            log.warning("HEAD %s failed: %s", url, e)
+            log.warning("probe %s failed: %s", url, e)
     return None
 
 
@@ -278,8 +280,40 @@ def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
 
 # ------------------------------------------------------------- CMC GDPS -----
 # One GRIB2 per field per step on the MSC Datamart, global 0.15° lat-lon.
-CMC_URL = ("https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/"
-           "CMC_glb_{var}_latlon.15x.15_{ymd}{hh}_P{fhr:03d}.grib2")
+# MSC has been migrating Datamart layouts; try each until one answers.
+CMC_SCHEMES = [
+    # dated tree, classic names
+    "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/CMC_glb_{var}_latlon.15x.15_{ymd}{hh}_P{fhr:03d}.grib2",
+    # legacy tree, classic names
+    "https://dd.weather.gc.ca/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/CMC_glb_{var}_latlon.15x.15_{ymd}{hh}_P{fhr:03d}.grib2",
+    # new WMO-style names
+    "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr:03d}/{ymd}T{hh}Z_MSC_GDPS_{var}_RLatLon0.15x0.15_PT{fhr:03d}H.grib2",
+    "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/{ymd}T{hh}Z_MSC_GDPS_{var}_RLatLon0.15x0.15_PT{fhr:03d}H.grib2",
+]
+_CMC_SCHEME = None
+
+
+def cmc_scheme(run: dt.datetime, session: requests.Session | None = None) -> str:
+    """Pick the URL layout that actually serves this run's PRMSL at step 0.
+    Logs every attempt's status so a layout change is obvious in the Actions log."""
+    global _CMC_SCHEME
+    if _CMC_SCHEME:
+        return _CMC_SCHEME
+    session = session or requests.Session()
+    for tmpl in CMC_SCHEMES:
+        url = tmpl.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=0, var="PRMSL_MSL_0")
+        try:
+            r = session.get(url, timeout=30, stream=True); r.close()
+            log.info("CMC layout probe %s -> HTTP %s", url, r.status_code)
+            if r.status_code == 200:
+                _CMC_SCHEME = tmpl
+                return tmpl
+        except requests.RequestException as e:
+            log.info("CMC layout probe %s -> %s", url, e)
+    return CMC_SCHEMES[0]
+
+
+CMC_URL = CMC_SCHEMES[0]
 CMC_NAMES = {   # generic (field, level) -> Datamart VAR_LEVELTYPE_LEVEL
     "gh": "HGT_ISBL_{lev}", "t": "TMP_ISBL_{lev}", "u": "UGRD_ISBL_{lev}", "v": "VGRD_ISBL_{lev}",
     "r": "RH_ISBL_{lev}", "vo": "ABSV_ISBL_{lev}",
@@ -288,7 +322,8 @@ CMC_NAMES = {   # generic (field, level) -> Datamart VAR_LEVELTYPE_LEVEL
 }
 
 
-def cmc_urls(run: dt.datetime, step: int, pairs: set) -> list[str]:
+def cmc_urls(run: dt.datetime, step: int, pairs: set, session: requests.Session | None = None) -> list[str]:
+    scheme = cmc_scheme(run, session)
     urls = []
     for name, lev in pairs:
         if name == "tp" and step == 0:
@@ -296,8 +331,7 @@ def cmc_urls(run: dt.datetime, step: int, pairs: set) -> list[str]:
         tmpl = CMC_NAMES.get(name)
         if not tmpl:
             continue
-        urls.append(CMC_URL.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step,
-                                   var=tmpl.format(lev=lev)))
+        urls.append(scheme.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step, var=tmpl.format(lev=lev)))
     return urls
 
 
@@ -372,7 +406,7 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
-    urls = cmc_urls(run, step, pairs) if MODEL["source"] == "cmc" else icon_urls(run, step, pairs)
+    urls = cmc_urls(run, step, pairs, session) if MODEL["source"] == "cmc" else icon_urls(run, step, pairs)
     if not urls:
         raise RuntimeError(f"nothing to fetch for step {step}")
     raw = dest.with_suffix(".raw.grib2")
