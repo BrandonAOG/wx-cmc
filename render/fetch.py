@@ -84,7 +84,7 @@ def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
     if src == "ecmwf_opendata":
         return ECMWF_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step)
     if src == "cmc":
-        return cmc_probe_url(run, step)
+        return None            # handled in run_max_hour via cmc_step_complete
     if src == "icon":
         return icon_urls(run, step, {("msl", None)})[0]
     return None
@@ -97,6 +97,12 @@ def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> i
         return MODEL["hours"][-1]
     session = session or requests.Session()
     for last in MODEL.get("probe_max_hours", [MODEL["hours"][-1]]):
+        if MODEL["source"] == "cmc":
+            # also require the last 6-hourly step before the end, so a run whose
+            # tail happens to be up first isn't mistaken for complete
+            if cmc_step_complete(run, last, session) and cmc_step_complete(run, last - 6, session):
+                return last
+            continue
         url = _probe_url(run, last, session)
         try:
             r = session.get(url, timeout=30, allow_redirects=True, stream=True); r.close()
@@ -310,15 +316,31 @@ CMC_PATTERNS = {
 _CMC_TOKENS: dict | None = None
 
 
-def _listing(session, url):
-    """href targets from an Apache-style directory index."""
-    try:
-        r = session.get(url, timeout=30)
-        if r.status_code != 200:
-            log.info("listing %s -> HTTP %s", url, r.status_code); return []
-        return [h for h in re.findall(r'href="([^"?][^"]*)"', r.text) if not h.startswith("/")]
-    except requests.RequestException as e:
-        log.info("listing %s failed: %s", url, e); return []
+def _listing(session, url, retries: int = 4):
+    """href targets from an Apache-style directory index. The Datamart gets
+    slow when many jobs hit it at once, so retry with backoff."""
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=90)
+            if r.status_code == 200:
+                return [h for h in re.findall(r'href="([^"?][^"]*)"', r.text) if not h.startswith("/")]
+            if r.status_code == 404:
+                return []
+            log.info("listing %s -> HTTP %s", url, r.status_code)
+        except requests.RequestException as e:
+            log.info("listing %s failed (attempt %d): %s", url, attempt + 1, str(e)[:80])
+        time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+    return []
+
+
+# Confirmed against the live Datamart (Sep 2026); used when the listing is unreachable.
+CMC_DEFAULT_TOKENS = {
+    "gh": "GeopotentialHeight_IsbL-{lev:04d}", "t": "AirTemp_IsbL-{lev:04d}", "u": "WindU_IsbL-{lev:04d}",
+    "v": "WindV_IsbL-{lev:04d}", "r": "RelativeHumidity_IsbL-{lev:04d}", "vo": "AbsoluteVorticity_IsbL-{lev:04d}",
+    "msl": "PressureMSL_MSL-0", "tp": "PrecipAccum_Sfc-0", "2t": "AirTemp_AGL-2m", "10u": "WindU_AGL-10m",
+    "10v": "WindV_AGL-10m", "cape": "CAPE_Sfc-0", "snod": "SnowDepth_Sfc-0", "skt": "SurfaceTemp_Sfc-0",
+    "lsm": "LandCover_Sfc-0",
+}
 
 
 def cmc_tokens(run: dt.datetime, session: requests.Session | None = None) -> dict:
@@ -337,9 +359,9 @@ def cmc_tokens(run: dt.datetime, session: requests.Session | None = None) -> dic
                 names.add(m.group(1))
     tokens: dict = {}
     if not names:
-        log.warning("CMC: empty listing for %s %sZ", ymd, hh)
-        _CMC_TOKENS = tokens
-        return tokens
+        log.warning("CMC: listing unavailable for %s %sZ; using known field names", ymd, hh)
+        _CMC_TOKENS = dict(CMC_DEFAULT_TOKENS)
+        return _CMC_TOKENS
     for field, pats in CMC_PATTERNS.items():
         # isobaric fields: find the family once using level 0500, then template the level
         for pat in pats:
@@ -349,7 +371,11 @@ def cmc_tokens(run: dt.datetime, session: requests.Session | None = None) -> dic
                 tokens[field] = hit.replace("0500", "{lev:04d}") if "{lev}" in pat else hit
                 break
         if field not in tokens:
-            log.warning("CMC: no match for '%s' (tried %s)", field, pats[0])
+            if field in CMC_DEFAULT_TOKENS:
+                tokens[field] = CMC_DEFAULT_TOKENS[field]
+                log.warning("CMC: no listing match for '%s'; using default %s", field, tokens[field])
+            else:
+                log.warning("CMC: no match for '%s' (tried %s)", field, pats[0])
     log.info("CMC resolved %d/%d fields: %s", len(tokens), len(CMC_PATTERNS), tokens)
     unmatched = sorted(n for n in names if not any(n == t or re.fullmatch(t.replace("{lev:04d}", r"\d{4}"), n) for t in tokens.values()))
     log.info("CMC other variables present (%d): %s", len(unmatched), " ".join(unmatched[:80]))
@@ -372,9 +398,15 @@ def cmc_urls(run: dt.datetime, step: int, pairs: set, session: requests.Session 
     return urls
 
 
-def cmc_probe_url(run: dt.datetime, step: int) -> str:
-    """Existence check that needs no token resolution: step directory listing."""
-    return CMC_DIR.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step)
+def cmc_step_complete(run: dt.datetime, step: int, session, min_files: int = 40) -> bool:
+    """The Datamart creates step folders before all files arrive, so 'folder
+    exists' isn't enough: require a populated listing including MSLP."""
+    files = [f for f in _listing(session, CMC_DIR.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step))
+             if f.endswith(".grib2")]
+    ok = len(files) >= min_files and any("MSL" in f for f in files)
+    if not ok:
+        log.info("CMC step %03d: %d files present, not complete", step, len(files))
+    return ok
 
 
 # ------------------------------------------------------------- DWD ICON -----
