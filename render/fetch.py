@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -83,7 +84,7 @@ def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
     if src == "ecmwf_opendata":
         return ECMWF_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step)
     if src == "cmc":
-        return cmc_urls(run, step, {("msl", None)}, session)[0]
+        return cmc_probe_url(run, step)
     if src == "icon":
         return icon_urls(run, step, {("msl", None)})[0]
     return None
@@ -279,60 +280,101 @@ def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
 
 
 # ------------------------------------------------------------- CMC GDPS -----
-# One GRIB2 per field per step on the MSC Datamart, global 0.15° lat-lon.
-# MSC has been migrating Datamart layouts; try each until one answers.
-CMC_SCHEMES = [
-    # dated tree, classic names
-    "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/CMC_glb_{var}_latlon.15x.15_{ymd}{hh}_P{fhr:03d}.grib2",
-    # legacy tree, classic names
-    "https://dd.weather.gc.ca/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/CMC_glb_{var}_latlon.15x.15_{ymd}{hh}_P{fhr:03d}.grib2",
-    # new WMO-style names
-    "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr:03d}/{ymd}T{hh}Z_MSC_GDPS_{var}_RLatLon0.15x0.15_PT{fhr:03d}H.grib2",
-    "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/{ymd}T{hh}Z_MSC_GDPS_{var}_RLatLon0.15x0.15_PT{fhr:03d}H.grib2",
-]
-_CMC_SCHEME = None
+# MSC Datamart (2025+ layout): one GRIB2 per field per step, global 0.15° lat-lon.
+#   https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr}/
+#   {ymd}T{hh}Z_MSC_GDPS_{Variable}_{LevelType}-{Level}_LatLon0.15_PT{fhr}H.grib2
+# Variable names are descriptive (AirTemp, AbsoluteVorticity, ...). We resolve
+# each generic field against the directory listing so renames don't break us.
+CMC_DIR = "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr:03d}/"
+CMC_FILE = "{ymd}T{hh}Z_MSC_GDPS_{token}_LatLon0.15_PT{fhr:03d}H.grib2"
 
-
-def cmc_scheme(run: dt.datetime, session: requests.Session | None = None) -> str:
-    """Pick the URL layout that actually serves this run's PRMSL at step 0.
-    Logs every attempt's status so a layout change is obvious in the Actions log."""
-    global _CMC_SCHEME
-    if _CMC_SCHEME:
-        return _CMC_SCHEME
-    session = session or requests.Session()
-    for tmpl in CMC_SCHEMES:
-        url = tmpl.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=0, var="PRMSL_MSL_0")
-        try:
-            r = session.get(url, timeout=30, stream=True); r.close()
-            log.info("CMC layout probe %s -> HTTP %s", url, r.status_code)
-            if r.status_code == 200:
-                _CMC_SCHEME = tmpl
-                return tmpl
-        except requests.RequestException as e:
-            log.info("CMC layout probe %s -> %s", url, e)
-    return CMC_SCHEMES[0]
-
-
-CMC_URL = CMC_SCHEMES[0]
-CMC_NAMES = {   # generic (field, level) -> Datamart VAR_LEVELTYPE_LEVEL
-    "gh": "HGT_ISBL_{lev}", "t": "TMP_ISBL_{lev}", "u": "UGRD_ISBL_{lev}", "v": "VGRD_ISBL_{lev}",
-    "r": "RH_ISBL_{lev}", "vo": "ABSV_ISBL_{lev}",
-    "msl": "PRMSL_MSL_0", "tp": "APCP_SFC_0", "2t": "TMP_TGL_2", "10u": "UGRD_TGL_10", "10v": "VGRD_TGL_10",
-    "cape": "CAPE_SFC_0", "snod": "SNOD_SFC_0", "skt": "TMP_SFC_0", "lsm": "LAND_SFC_0",
+# generic field -> regex candidates for the "{Variable}_{LevelType}-{Level}" token.
+# {lev} is the 4-digit isobaric level.
+CMC_PATTERNS = {
+    "gh":   [r"GeopotentialHeight_IsbL-{lev}", r"Geopotential.*_IsbL-{lev}", r"HGT_IsbL-{lev}"],
+    "t":    [r"AirTemp_IsbL-{lev}", r"TMP_IsbL-{lev}"],
+    "u":    [r"WindU_IsbL-{lev}", r"UGRD_IsbL-{lev}", r"WindComponentU_IsbL-{lev}", r"UWind_IsbL-{lev}"],
+    "v":    [r"WindV_IsbL-{lev}", r"VGRD_IsbL-{lev}", r"WindComponentV_IsbL-{lev}", r"VWind_IsbL-{lev}"],
+    "r":    [r"RelativeHumidity_IsbL-{lev}", r"RelHum_IsbL-{lev}", r"RH_IsbL-{lev}"],
+    "vo":   [r"AbsoluteVorticity_IsbL-{lev}", r"ABSV_IsbL-{lev}"],
+    "msl":  [r"PressureMSL_MSL-0", r"PressureReducedToMSL_MSL-0", r"MSLP_MSL-0", r"PRMSL_MSL-0", r"Pressure.*MSL"],
+    "tp":   [r"PrecipAccum_Sfc-0", r"TotalPrecip.*_Sfc-0", r"PrecipTotal.*_Sfc-0", r"APCP_Sfc-0", r"Precip.*Accum[^_]*_Sfc-0"],
+    "2t":   [r"AirTemp_AGL-2m", r"TMP_AGL-2m"],
+    "10u":  [r"WindU_AGL-10m", r"UGRD_AGL-10m", r"WindComponentU_AGL-10m"],
+    "10v":  [r"WindV_AGL-10m", r"VGRD_AGL-10m", r"WindComponentV_AGL-10m"],
+    "cape": [r"CAPE_Sfc-0", r"ConvectiveAvailablePotentialEnergy_Sfc-0"],
+    "snod": [r"SnowDepth_Sfc-0", r"SNOD_Sfc-0"],
+    "skt":  [r"SurfaceTemp_Sfc-0", r"SkinTemp_Sfc-0", r"AirTemp_Sfc-0", r"TMP_Sfc-0"],
+    "lsm":  [r"LandCover_Sfc-0", r"LandMask_Sfc-0", r"LandSeaMask_Sfc-0", r"LAND_Sfc-0", r"Land.*_Sfc-0"],
 }
+_CMC_TOKENS: dict | None = None
+
+
+def _listing(session, url):
+    """href targets from an Apache-style directory index."""
+    try:
+        r = session.get(url, timeout=30)
+        if r.status_code != 200:
+            log.info("listing %s -> HTTP %s", url, r.status_code); return []
+        return [h for h in re.findall(r'href="([^"?][^"]*)"', r.text) if not h.startswith("/")]
+    except requests.RequestException as e:
+        log.info("listing %s failed: %s", url, e); return []
+
+
+def cmc_tokens(run: dt.datetime, session: requests.Session | None = None) -> dict:
+    """Resolve generic fields to the Datamart's variable_level tokens by reading
+    the listing for step 0 (and step 6 for accumulated precip, absent at 0)."""
+    global _CMC_TOKENS
+    if _CMC_TOKENS is not None:
+        return _CMC_TOKENS
+    session = session or requests.Session()
+    ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
+    names = set()
+    for step in (0, 6):
+        for f in _listing(session, CMC_DIR.format(ymd=ymd, hh=hh, fhr=step)):
+            m = re.match(r".*?_MSC_GDPS_(.+)_LatLon0\.15_PT\d{3}H\.grib2$", f)
+            if m:
+                names.add(m.group(1))
+    tokens: dict = {}
+    if not names:
+        log.warning("CMC: empty listing for %s %sZ", ymd, hh)
+        _CMC_TOKENS = tokens
+        return tokens
+    for field, pats in CMC_PATTERNS.items():
+        # isobaric fields: find the family once using level 0500, then template the level
+        for pat in pats:
+            probe = pat.format(lev="0500") if "{lev}" in pat else pat
+            hit = next((n for n in sorted(names) if re.fullmatch(probe, n)), None)
+            if hit:
+                tokens[field] = hit.replace("0500", "{lev:04d}") if "{lev}" in pat else hit
+                break
+        if field not in tokens:
+            log.warning("CMC: no match for '%s' (tried %s)", field, pats[0])
+    log.info("CMC resolved %d/%d fields: %s", len(tokens), len(CMC_PATTERNS), tokens)
+    unmatched = sorted(n for n in names if not any(n == t or re.fullmatch(t.replace("{lev:04d}", r"\d{4}"), n) for t in tokens.values()))
+    log.info("CMC other variables present (%d): %s", len(unmatched), " ".join(unmatched[:80]))
+    _CMC_TOKENS = tokens
+    return tokens
 
 
 def cmc_urls(run: dt.datetime, step: int, pairs: set, session: requests.Session | None = None) -> list[str]:
-    scheme = cmc_scheme(run, session)
+    tokens = cmc_tokens(run, session)
+    ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
     urls = []
     for name, lev in pairs:
         if name == "tp" and step == 0:
             continue
-        tmpl = CMC_NAMES.get(name)
-        if not tmpl:
+        tok = tokens.get(name)
+        if not tok:
             continue
-        urls.append(scheme.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step, var=tmpl.format(lev=lev)))
+        token = tok.format(lev=int(lev)) if lev is not None else tok
+        urls.append(CMC_DIR.format(ymd=ymd, hh=hh, fhr=step) + CMC_FILE.format(ymd=ymd, hh=hh, token=token, fhr=step))
     return urls
+
+
+def cmc_probe_url(run: dt.datetime, step: int) -> str:
+    """Existence check that needs no token resolution: step directory listing."""
+    return CMC_DIR.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step)
 
 
 # ------------------------------------------------------------- DWD ICON -----
