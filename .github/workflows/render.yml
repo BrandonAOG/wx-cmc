@@ -51,7 +51,7 @@ jobs:
           HOURS: ${{ github.event.inputs.hours }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
-          ARGS="--chunks 20"
+          ARGS="--chunks 8"
           if [ -n "$RUN" ]; then ARGS="$ARGS --run $RUN"; fi
           if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
           if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
@@ -134,6 +134,9 @@ jobs:
 
   deploy:
     needs: assemble
+    # GitHub's default success() looks up the whole chain, so a failed render slice
+    # would skip this even when assemble passed. Deploy whenever assemble did.
+    if: always() && needs.assemble.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
